@@ -24,6 +24,7 @@ import queue
 import random
 import json
 import os
+import csv
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -69,6 +70,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "interval":       "Intervall (ms):",
         "max_points":     "Max. Punkte:",
         "autoscale":      "Autoskalierung",
+        "scroll":         "Auto-Scroll",
+        "scroll_win":     "Fenster (s):",
         "show_stats":     "Statistik anzeigen",
         "file":           "💾 Datei",
         "save_dir":       "Speicherpfad:",
@@ -159,6 +162,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "interval":       "Interval (ms):",
         "max_points":     "Max. Points:",
         "autoscale":      "Autoscale",
+        "scroll":         "Auto-Scroll",
+        "scroll_win":     "Window (s):",
         "show_stats":     "Show statistics",
         "file":           "💾 File",
         "save_dir":       "Save directory:",
@@ -350,7 +355,9 @@ DEFAULT_SETTINGS = {
     "resolution":  "5½ Digit",
     "interval_ms": "500",
     "max_points":  "1000",
-    "autoscale":   True,
+    "autoscale":    True,
+    "scroll":       False,   # auto-scroll mode
+    "scroll_win":   "30",    # visible time window in seconds
     "statistics":  True,
     "save_dir":    os.path.expanduser("~"),
     "prefix":      "Measurement",
@@ -564,15 +571,20 @@ class MultimeterApp(tk.Tk):
         self.measure_thread   = None
         self.data_queue       = queue.Queue()
 
-        # Live workbook state (per-value saving)
+        # Live saving state: CSV buffer during measurement, Excel on finalise
         self._autosave_counter        = 0
-        self._autosave_wb             = None
-        self._autosave_ws             = None
-        self._autosave_path           = ""
-        self._autosave_row            = 0
+        self._autosave_path           = ""   # final .xlsx path
+        self._autosave_csv_path       = ""   # temporary .csv buffer path
+        self._autosave_csv_file       = None # open file handle
+        self._autosave_csv_writer     = None # csv.writer instance
         self._autosave_t0             = 0.0
         self._autosave_abs_t0         = None
         self._autosave_data_row_count = 0
+        self._autosave_lock           = threading.Lock()  # thread-safe csv writes
+        # Legacy workbook refs kept for _finalize (now unused during measurement)
+        self._autosave_wb             = None
+        self._autosave_ws             = None
+        self._autosave_row            = 0
 
         self._build_style()
         self._build_layout()
@@ -602,6 +614,8 @@ class MultimeterApp(tk.Tk):
             "interval_ms": self.interval_var.get(),
             "max_points":  self.maxpts_var.get(),
             "autoscale":   bool(self.autoscale_var.get()),
+            "scroll":      bool(self.scroll_var.get()),
+            "scroll_win":  self.scroll_win_var.get(),
             "statistics":  bool(self.statistics_var.get()),
             "save_dir":    self.savedir_var.get(),
             "prefix":      self.prefix_var.get(),
@@ -628,6 +642,9 @@ class MultimeterApp(tk.Tk):
         self.interval_var.set(s["interval_ms"])
         self.maxpts_var.set(s["max_points"])
         self.autoscale_var.set(s["autoscale"])
+        self.scroll_var.set(s.get("scroll", False))
+        self.scroll_win_var.set(s.get("scroll_win", "30"))
+        self._on_scroll_toggle()
         self.statistics_var.set(s["statistics"])
         self.savedir_var.set(s["save_dir"])
         self.prefix_var.set(s.get("prefix", "Measurement"))
@@ -644,6 +661,15 @@ class MultimeterApp(tk.Tk):
         self.status_var.set(self.S["settings_saved"] + SETTINGS_FILE)
 
     # ── Language / theme helpers ──────────────────────────────────────────────
+
+    def _on_scroll_toggle(self):
+        """Enable/disable the window-size entry based on scroll checkbox."""
+        if hasattr(self, "scroll_win_entry"):
+            state = "normal" if self.scroll_var.get() else "disabled"
+            self.scroll_win_entry.configure(state=state)
+            # Auto-scroll and autoscale are mutually exclusive
+            if self.scroll_var.get():
+                self.autoscale_var.set(False)
 
     def _t(self, key: str) -> str:
         """Translate a string key using the active language."""
@@ -795,12 +821,26 @@ class MultimeterApp(tk.Tk):
 
         self.autoscale_var  = tk.BooleanVar(value=True)
         self.statistics_var = tk.BooleanVar(value=True)
+        self.scroll_var     = tk.BooleanVar(value=False)
+        self.scroll_win_var = tk.StringVar(value="30")
         ttk.Checkbutton(frm, text=self._t("autoscale"),
                         variable=self.autoscale_var).grid(
             row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
         ttk.Checkbutton(frm, text=self._t("show_stats"),
                         variable=self.statistics_var).grid(
             row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
+        # Auto-scroll row
+        self.scroll_cb = ttk.Checkbutton(
+            frm, text=self._t("scroll"),
+            variable=self.scroll_var,
+            command=self._on_scroll_toggle)
+        self.scroll_cb.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(frm, text=self._t("scroll_win")).grid(
+            row=5, column=0, sticky=tk.W, pady=2)
+        self.scroll_win_entry = ttk.Entry(
+            frm, textvariable=self.scroll_win_var, width=10)
+        self.scroll_win_entry.grid(
+            row=5, column=1, padx=(6, 0), pady=2, sticky=tk.EW)
         frm.columnconfigure(1, weight=1)
 
     # ── File / autosave frame ─────────────────────────────────────────────────
@@ -958,7 +998,7 @@ class MultimeterApp(tk.Tk):
                  font=("Courier New", 38, "bold")).pack(side=tk.LEFT)
         tk.Label(val_row, textvariable=self.display_unit,
                  bg=self.C["disp_bg"], fg=self.C["disp_unit"],
-                 font=("Courier New", 22)).pack(side=tk.LEFT, pady=(10, 0))
+                 font=("Courier New", 38, "bold")).pack(side=tk.LEFT, padx=(6, 0))
 
     # ── Live plot ─────────────────────────────────────────────────────────────
 
@@ -1161,6 +1201,16 @@ class MultimeterApp(tk.Tk):
         unit  = Multimeter34401A.UNITS.get(key, "")
         self.dmm.configure(key, self.range_var.get(), self.res_var.get())
 
+        # Clear previous plot data before starting a new measurement
+        self.data_timestamps.clear()
+        self.data_values.clear()
+        self.line.set_data([], [])
+        self.stat_text.set_text("")
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw_idle()
+        self.display_value.set("- - - - - -")
+
         # Update display immediately
         self.display_func.set(func)
         self.display_unit.set(unit)
@@ -1172,7 +1222,7 @@ class MultimeterApp(tk.Tk):
         self.btn_save.configure(state="disabled")
         self.autosave_status_var.set("")
 
-        # Open live workbook if autosave is enabled
+        # Open CSV buffer for live saving (converted to Excel at measurement end)
         if self.autosave_var.get() and OPENPYXL_AVAILABLE:
             self._open_live_workbook()
 
@@ -1216,8 +1266,8 @@ class MultimeterApp(tk.Tk):
             elapsed = time.time() - t0
             self.data_queue.put((elapsed, val))
 
-            # Write to live workbook immediately
-            if self._autosave_wb is not None:
+            # Append to CSV buffer immediately (non-blocking)
+            if self._autosave_csv_writer is not None:
                 self._append_live_row(elapsed, val)
 
             # Stop when max points reached
@@ -1250,7 +1300,25 @@ class MultimeterApp(tk.Tk):
 
             self.line.set_data(self.data_timestamps, self.data_values)
 
-            if self.autoscale_var.get():
+            if self.scroll_var.get():
+                # Auto-scroll: fixed time window, newest data always visible
+                try:
+                    win = float(self.scroll_win_var.get())
+                except ValueError:
+                    win = 30.0
+                tmax = self.data_timestamps[-1]
+                tmin = max(self.data_timestamps[0], tmax - win)
+                # Y-range from visible points only
+                visible = [v for t, v in zip(self.data_timestamps,
+                                             self.data_values)
+                           if tmin <= t <= tmax]
+                if visible:
+                    vmin, vmax = min(visible), max(visible)
+                    margin = ((vmax - vmin) * 0.05
+                              if vmax != vmin else abs(vmax) * 0.05 + 1e-9)
+                    self.ax.set_ylim(vmin - margin, vmax + margin)
+                self.ax.set_xlim(tmin, tmax if tmax > tmin else tmin + 1)
+            elif self.autoscale_var.get():
                 self.ax.relim()
                 self.ax.autoscale_view()
             else:
@@ -1311,143 +1379,230 @@ class MultimeterApp(tk.Tk):
     # ── Live workbook (per-value saving) ──────────────────────────────────────
 
     def _open_live_workbook(self):
-        """Create a new workbook at measurement start and write the header."""
+        """Open a lightweight CSV buffer at measurement start.
+        The CSV is converted to Excel only once when the measurement ends.
+        This avoids re-saving the entire workbook on every sample.
+        """
         if not OPENPYXL_AVAILABLE:
             return
         try:
             os.makedirs(self.savedir_var.get(), exist_ok=True)
-            filename             = self._build_save_filename()
-            self._autosave_path  = os.path.join(self.savedir_var.get(), filename)
-            self._autosave_t0    = time.time()
+            filename              = self._build_save_filename()
+            self._autosave_path   = os.path.join(self.savedir_var.get(), filename)
+            # Temporary CSV sits next to the final xlsx
+            self._autosave_csv_path = self._autosave_path.replace(".xlsx", ".csv~")
+            self._autosave_t0     = time.time()
             self._autosave_abs_t0 = datetime.datetime.now()
+            self._autosave_data_row_count = 0
 
             key  = self._label_to_key(self.func_var.get())
             func = self.func_var.get()
             unit = Multimeter34401A.UNITS.get(key, "")
 
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = self._t("sheet_data")
+            # Open CSV for streaming append – newline="" required by csv module
+            self._autosave_csv_file   = open(
+                self._autosave_csv_path, "w", newline="", encoding="utf-8")
+            self._autosave_csv_writer = csv.writer(self._autosave_csv_file)
 
-            # Plain bold header row – no colours, no merged cells
-            header_row = 1
-            bold = Font(bold=True)
-            for col, txt in enumerate([
-                    self._t("col_nr"),
-                    self._t("col_time"),
-                    f"{func} ({unit})",
-                    self._t("col_abs")], start=1):
-                cell = ws.cell(row=header_row, column=col, value=txt)
-                cell.font = bold
+            # Write header row
+            self._autosave_csv_writer.writerow([
+                self._t("col_nr"),
+                self._t("col_time"),
+                f"{func} ({unit})",
+                self._t("col_abs"),
+            ])
+            self._autosave_csv_file.flush()
 
-            for col_letter, width in zip("ABCD", [8, 14, 20, 16]):
-                ws.column_dimensions[col_letter].width = width
-
-            self._autosave_wb             = wb
-            self._autosave_ws             = ws
-            self._autosave_row            = header_row + 1
-            self._autosave_data_row_count = 0
-
-            wb.save(self._autosave_path)
             self.after(0, lambda fn=filename: self.autosave_status_var.set(
                 self._t("live_active") + fn))
         except Exception as e:
-            self._autosave_wb = None
+            self._autosave_csv_file   = None
+            self._autosave_csv_writer = None
             self.after(0, lambda err=e: self.autosave_status_var.set(
                 self._t("file_open_err") + str(err)))
 
     def _append_live_row(self, elapsed: float, val: float):
-        """Append one measurement row to the open workbook and save immediately."""
-        if self._autosave_wb is None or self._autosave_ws is None:
+        """Append one measurement row to the CSV buffer.
+        Writing a single CSV line is ~1000x faster than re-saving a workbook,
+        ensuring the measurement interval is never delayed by file I/O.
+        """
+        if self._autosave_csv_writer is None:
             return
         try:
-            self._autosave_data_row_count += 1
-            i        = self._autosave_data_row_count
-            abs_time = self._autosave_abs_t0 + datetime.timedelta(seconds=elapsed)
-            row      = self._autosave_row
-
-            self._autosave_ws.cell(row=row, column=1, value=i)
-            self._autosave_ws.cell(row=row, column=2, value=round(elapsed, 4))
-            self._autosave_ws.cell(row=row, column=3, value=round(val, 9))
-            self._autosave_ws.cell(row=row, column=4,
-                                   value=abs_time.strftime("%H:%M:%S.%f")[:-3])
-            self._autosave_row += 1
-            self._autosave_wb.save(self._autosave_path)
+            with self._autosave_lock:
+                self._autosave_data_row_count += 1
+                i        = self._autosave_data_row_count
+                abs_time = self._autosave_abs_t0 + datetime.timedelta(seconds=elapsed)
+                self._autosave_csv_writer.writerow([
+                    i,
+                    round(elapsed, 4),
+                    round(val, 9),
+                    abs_time.strftime("%H:%M:%S.%f")[:-3],
+                ])
+                self._autosave_csv_file.flush()  # OS-level flush – data on disk immediately
         except Exception:
-            pass  # Silent – do not interrupt measurement for save errors
+            pass  # Silent – never interrupt the measurement thread
 
     def _finalize_live_workbook(self):
-        """Append statistics + embedded chart to the live workbook and close."""
-        if self._autosave_wb is None:
+        """Convert the CSV buffer to a proper Excel file in a background thread.
+        Steps:
+          1. Close the CSV file handle
+          2. Read all rows from CSV
+          3. Build workbook with plain table + optional stats + optional chart
+          4. Delete the temporary CSV
+        """
+        if self._autosave_csv_writer is None and self._autosave_data_row_count == 0:
             return
+        # Snapshot values needed in the background thread
+        n          = self._autosave_data_row_count
+        csv_path   = self._autosave_csv_path
+        xlsx_path  = self._autosave_path
+        timestamps = list(self.data_timestamps)
+        values     = list(self.data_values)
+        inc_stats  = self.excel_stats_var.get()
+        inc_chart  = self.excel_chart_var.get()
+        key        = self._label_to_key(self.func_var.get())
+        func       = self.func_var.get()
+        unit       = Multimeter34401A.UNITS.get(key, "")
+        strings    = dict(self.S)   # language strings snapshot
+
+        # Close CSV file before reading it in the background thread
         try:
-            wb   = self._autosave_wb
-            ws   = self._autosave_ws
-            key  = self._label_to_key(self.func_var.get())
-            func = self.func_var.get()
-            unit = Multimeter34401A.UNITS.get(key, "")
-            n    = self._autosave_data_row_count
+            if self._autosave_csv_file:
+                self._autosave_csv_file.close()
+        except Exception:
+            pass
+        finally:
+            self._autosave_csv_file   = None
+            self._autosave_csv_writer = None
+            self._autosave_data_row_count = 0
 
-            if n > 0 and self.data_values:
-                arr      = np.array(self.data_values[-n:])
-                stat_row = self._autosave_row + 1
+        # Convert in background so GUI stays responsive
+        t = threading.Thread(
+            target=self._csv_to_excel_thread,
+            args=(csv_path, xlsx_path, n, timestamps, values,
+                  inc_stats, inc_chart, func, unit, strings),
+            daemon=True)
+        t.start()
 
-                # --- Optional statistics block ---
-                if self.excel_stats_var.get():
-                    bold = Font(bold=True)
+    def _csv_to_excel_thread(self, csv_path, xlsx_path, n,
+                              timestamps, values,
+                              inc_stats, inc_chart,
+                              func, unit, strings):
+        """Background thread: read CSV buffer and write final Excel file."""
+        def _t(k): return strings.get(k, k)
+        try:
+            # ── Read CSV rows ─────────────────────────────────────────────────
+            rows = []
+            if os.path.isfile(csv_path):
+                with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.reader(f)
+                    next(reader, None)   # skip header (we write our own)
+                    for row in reader:
+                        rows.append(row)
+
+            # ── Build workbook ────────────────────────────────────────────────
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = _t("sheet_data")
+
+            bold = Font(bold=True)
+            # Header row
+            for col, txt in enumerate([
+                    _t("col_nr"), _t("col_time"),
+                    f"{func} ({unit})", _t("col_abs")], start=1):
+                ws.cell(row=1, column=col, value=txt).font = bold
+
+            # Data rows from CSV
+            for i, row in enumerate(rows, start=1):
+                xl_row = 1 + i
+                try:
+                    ws.cell(row=xl_row, column=1, value=int(row[0]))
+                    ws.cell(row=xl_row, column=2, value=float(row[1]))
+                    ws.cell(row=xl_row, column=3, value=float(row[2]))
+                    ws.cell(row=xl_row, column=4, value=row[3])
+                except (IndexError, ValueError):
+                    pass   # skip malformed rows
+
+            # Auto column widths
+            for col_letter, width in zip("ABCD", [8, 14, 20, 16]):
+                ws.column_dimensions[col_letter].width = width
+
+            # ── Optional statistics ───────────────────────────────────────────
+            actual_n = len(rows)
+            if inc_stats and actual_n > 0:
+                # Extract values from CSV rows (column index 2)
+                try:
+                    csv_vals = np.array([float(r[2]) for r in rows])
+                except (IndexError, ValueError):
+                    csv_vals = np.array([])
+                if csv_vals.size > 0:
+                    stat_row = 1 + actual_n + 2
                     ws.cell(row=stat_row, column=1,
-                            value=self._t("statistics")).font = bold
+                            value=_t("statistics")).font = bold
                     for j, (k, v) in enumerate([
-                        (self._t("count"),     str(n)),
-                        (self._t("mean"),      f"{arr.mean():.9g} {unit}"),
-                        (self._t("std"),       f"{arr.std():.6g} {unit}"),
-                        (self._t("minimum"),   f"{arr.min():.9g} {unit}"),
-                        (self._t("maximum"),   f"{arr.max():.9g} {unit}"),
-                        (self._t("peak_peak"), f"{arr.max() - arr.min():.6g} {unit}"),
+                        (_t("count"),     str(actual_n)),
+                        (_t("mean"),      f"{csv_vals.mean():.9g} {unit}"),
+                        (_t("std"),       f"{csv_vals.std():.6g} {unit}"),
+                        (_t("minimum"),   f"{csv_vals.min():.9g} {unit}"),
+                        (_t("maximum"),   f"{csv_vals.max():.9g} {unit}"),
+                        (_t("peak_peak"), f"{csv_vals.max() - csv_vals.min():.6g} {unit}"),
                     ], start=1):
                         ws.cell(row=stat_row + j, column=1, value=k).font = bold
                         ws.cell(row=stat_row + j, column=2, value=v)
 
-                # --- Optional embedded chart ---
-                if self.excel_chart_var.get():
-                    # Use a helper sheet as chart data source so the main sheet stays clean
-                    ws_chart = wb.create_sheet(self._t("sheet_chart"))
-                    ws_chart.cell(row=1, column=1,
-                                  value=self._t("col_time")).font = Font(bold=True)
-                    ws_chart.cell(row=1, column=2,
-                                  value=f"{func} ({unit})").font = Font(bold=True)
-                    for idx, (ts, val) in enumerate(
-                            zip(self.data_timestamps, self.data_values), start=2):
-                        ws_chart.cell(row=idx, column=1, value=round(ts, 4))
-                        ws_chart.cell(row=idx, column=2, value=round(val, 9))
+            # ── Optional chart on separate sheet ──────────────────────────────
+            # Use only the CSV rows (= this measurement only) as chart source.
+            # Never use the global timestamps/values lists which may contain
+            # data from previous measurement runs.
+            if inc_chart and actual_n > 0 and rows:
+                ws_c = wb.create_sheet(_t("sheet_chart"))
+                ws_c.cell(row=1, column=1, value=_t("col_time")).font = bold
+                ws_c.cell(row=1, column=2, value=f"{func} ({unit})").font = bold
+                # Normalise time to start at 0
+                try:
+                    t0_csv = float(rows[0][1])
+                except (IndexError, ValueError):
+                    t0_csv = 0.0
+                for idx, row in enumerate(rows, start=2):
+                    try:
+                        ws_c.cell(row=idx, column=1,
+                                  value=round(float(row[1]) - t0_csv, 4))
+                        ws_c.cell(row=idx, column=2,
+                                  value=round(float(row[2]), 9))
+                    except (IndexError, ValueError):
+                        pass
 
-                    chart              = LineChart()
-                    chart.title        = f"{func} – {self._t('chart_title')}"
-                    chart.style        = 10
-                    chart.y_axis.title = f"{func} ({unit})"
-                    chart.x_axis.title = self._t("time_axis")
-                    data_ref = Reference(ws_chart, min_col=2, min_row=1,
-                                         max_row=len(self.data_values) + 1)
-                    time_ref = Reference(ws_chart, min_col=1, min_row=2,
-                                         max_row=len(self.data_values) + 1)
-                    chart.add_data(data_ref, titles_from_data=True)
-                    chart.set_categories(time_ref)
-                    chart.width  = 22
-                    chart.height = 14
-                    ws_chart.add_chart(chart, "D2")
+                chart              = LineChart()
+                chart.title        = f"{func} – {_t('chart_title')}"
+                chart.style        = 10
+                chart.y_axis.title = f"{func} ({unit})"
+                chart.x_axis.title = _t("time_axis")
+                data_ref = Reference(ws_c, min_col=2, min_row=1,
+                                     max_row=actual_n + 1)
+                time_ref = Reference(ws_c, min_col=1, min_row=2,
+                                     max_row=actual_n + 1)
+                chart.add_data(data_ref, titles_from_data=True)
+                chart.set_categories(time_ref)
+                chart.width  = 22
+                chart.height = 14
+                ws_c.add_chart(chart, "D2")
 
-            wb.save(self._autosave_path)
-            fname = os.path.basename(self._autosave_path)
-            self.after(0, lambda fn=fname, cnt=n: self.autosave_status_var.set(
-                f"{self._t('live_done')} ({cnt} {self._t('pt_count')})  →  {fn}"))
+            wb.save(xlsx_path)
+            fname = os.path.basename(xlsx_path)
+            self.after(0, lambda fn=fname, cnt=actual_n:
+                       self.autosave_status_var.set(
+                           f"{_t('live_done')} ({cnt} {_t('pt_count')})  →  {fn}"))
         except Exception as e:
             self.after(0, lambda err=e: self.autosave_status_var.set(
-                self._t("finalize_err") + str(err)))
+                _t("finalize_err") + str(err)))
         finally:
-            self._autosave_wb             = None
-            self._autosave_ws             = None
-            self._autosave_row            = 0
-            self._autosave_data_row_count = 0
+            # Remove temporary CSV buffer
+            try:
+                if os.path.isfile(csv_path):
+                    os.remove(csv_path)
+            except Exception:
+                pass
 
     # ── File dialogs ──────────────────────────────────────────────────────────
 

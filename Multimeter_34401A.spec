@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['pyvisa', 'pyvisa.resources', 'openpyxl', 'openpyxl.styles', 'openpyxl.chart', 'matplotlib.backends.backend_tkagg', 'numpy']
+hiddenimports = ['pyvisa', 'pyvisa.resources', 'pyvisa.resources.gpib', 'pyvisa.resources.serial', 'pyvisa.resources.usb', 'openpyxl', 'openpyxl.styles', 'openpyxl.chart', 'matplotlib.backends.backend_tkagg', 'numpy']
 hiddenimports += collect_submodules('matplotlib')
 
 
 a = Analysis(
-    ['multimeter_34401A.py'],
+    ['C:\\Users\\raigk\\claude\\Multimeter-34401a\\multimeter_34401A.py'],
     pathex=[],
     binaries=[],
     datas=[],
